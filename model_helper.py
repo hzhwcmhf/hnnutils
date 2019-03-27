@@ -23,7 +23,7 @@ class BaseModel():
 
 		self.now_batch = 0
 		self.now_epoch = 0
-		
+
 		self.checkpoint_manager = checkpoint_manager
 		self.helperList = helperList or {}
 		self.helperList["checkpoint_manager"] = self.checkpoint_manager
@@ -49,7 +49,7 @@ class BaseModel():
 				logging.info("Args differences\n%s", json.dumps(diff, indent=2))
 			self.now_batch = checkpoint['now_batch']
 			self.now_epoch = checkpoint['now_epoch']
-			self.net.load_state_dict(checkpoint['weights'], args.load_exclude_set)
+			self.net.load_state_dict(checkpoint['weights'], param.volatile.load_exclude_set)
 			self.param.other_weights = checkpoint['other_weights']
 			for name, optimizer in self.optimizerList.items():
 				if checkpoint[name]['state'] and self.param.args.restore_optimizer:
@@ -57,7 +57,7 @@ class BaseModel():
 					self.optimizerCuda(optimizer)
 			for name, helper in self.helperList.items():
 				helper.load_state_dict(checkpoint[name])
-			logging.info("loaded checkpoint at %d epochs, %d batchs", self.now_epoch, self.now_batch)
+			logging.info("loaded checkpoint at %d epochs, %d batches", self.now_epoch, self.now_batch)
 
 		for key, v in args.items():
 			if isinstance(v, AnnealParameter):
@@ -67,11 +67,8 @@ class BaseModel():
 					self.anneal_list.append(AnnealHelper(self, key, 0, 0, **v[1]))
 					self.param.other_weights[key] = v[1]["startValue"]
 
-		if args.restore is not None and args.restoreCallback:
-			args.restoreCallback(self)
-			del args['restoreCallback']
-
-		del args['load_exclude_set']
+		if args.restore is not None and param.volatile.restoreCallback:
+			param.volatile.restoreCallback(self)
 
 		cuda(self.net)
 

@@ -35,7 +35,7 @@ class CheckpointManager:
 		with open("%s/checkpoint_list" % self.model_dir, "w") as checkpoint_list_fp:
 			json.dump(dic, checkpoint_list_fp)
 
-	def update_best(self, value = None):
+	def update_best(self, value=None):
 		if value and self.best_mode:
 			if self.best_mode == "max":
 				if value > self.best_value:

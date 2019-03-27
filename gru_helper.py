@@ -7,7 +7,7 @@ from torch.nn import Parameter
 from torch.nn.modules.rnn import GRU
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
-from .cuda_helper import zeros
+from .cuda_helper import zeros, Tensor
 
 F_GRUCell = torch._C._VariableFunctions.gru_cell
 
@@ -59,6 +59,14 @@ def copySequence(data, length): # for BOW loss
 		arr.append(data[i].repeat(length[i], 1))
 	return torch.cat(arr, dim=0)
 
+def generateMask(seqlen, length, type=int):
+	return Tensor(
+		(np.expand_dims(np.arange(seqlen), 1) < np.expand_dims(length, 0)).astype(type))
+
+def maskedSoftmax(data, length):
+	mask = generateMask(data.shape[0], length)
+	return data.masked_fill(mask == 0, -1e9).softmax(dim=0)
+
 class MyGRU(nn.Module):
 	def __init__(self, input_size, hidden_size, layers=1, bidirectional=False, initpara=True):
 		super(MyGRU, self).__init__()
@@ -96,9 +104,57 @@ class MyGRU(nn.Module):
 		if need_h:
 			h = pad_packed_sequence(h)[0]
 			h = revertSequence(h, memo, True)
-			return h, h_n
+			return h_n, h
 		else:
-			return h_n
+			return h_n, None
+
+class SingleGRU(nn.Module):
+	def __init__(self, input_size, hidden_size, initpara=True):
+		super().__init__()
+
+		self.input_size, self.hidden_size = input_size, hidden_size
+		self.GRU = GRU(input_size, hidden_size, 1)
+		self.initpara = initpara
+		if initpara:
+			self.h_init = Parameter(torch.Tensor(1, 1, hidden_size))
+			stdv = 1.0 / math.sqrt(self.hidden_size)
+			self.h_init.data.uniform_(-stdv, stdv)
+
+	def getInitialParameter(self, batch_size):
+		return self.h_init.repeat(1, batch_size, 1)
+
+	def forward(self, incoming, length, h_init=None, need_h=False):
+		sen_sorted, length_sorted, memo = sortSequence(incoming, length)
+		left_batch_size = sen_sorted.shape[-2]
+		sen_packed = pack_padded_sequence(sen_sorted, length_sorted)
+		if h_init is None:
+			h_init = self.getInitialParameter(left_batch_size)
+		else:
+			h_init = torch.unsqueeze(sortSequenceByMemo(h_init, memo), 0)
+		h, h_n = self.GRU(sen_packed, h_init)
+		h_n = h_n.transpose(0, 1).reshape(left_batch_size, -1)
+		h_n = revertSequence(h_n, memo)
+		if need_h:
+			h = pad_packed_sequence(h)[0]
+			h = revertSequence(h, memo, True)
+			return h_n, h
+		else:
+			return h_n, None
+
+	def init_forward(self, batch_size, h_init=None):
+		if h_init is None:
+			h_init = self.getInitialParameter(batch_size)
+		else:
+			h_init = torch.unsqueeze(h_init, 0)
+		h_history = h_init
+		h = h_init[0]
+
+		def nextStep(incoming, stopmask):
+			nonlocal h_history, h
+			h = self.cell_forward(incoming, h) * (1 - stopmask).float().unsqueeze(-1)
+			return h
+
+		return nextStep
 
 	def cell_forward(self, incoming, h):
 		return F_GRUCell( \
@@ -106,3 +162,185 @@ class MyGRU(nn.Module):
 				self.GRU.weight_ih_l0, self.GRU.weight_hh_l0, \
 				self.GRU.bias_ih_l0, self.GRU.bias_hh_l0, \
 		)
+
+class SingleAttnGRU(nn.Module):
+	def __init__(self, input_size, hidden_size, post_size, initpara=True):
+		super().__init__()
+
+		self.input_size, self.hidden_size, self.post_size = \
+			input_size, hidden_size, post_size
+		self.GRU = GRU(input_size + post_size, hidden_size, 1)
+
+		self.attn_query = nn.Linear(hidden_size, post_size)
+
+		if initpara:
+			self.h_init = Parameter(torch.Tensor(1, 1, hidden_size))
+			stdv = 1.0 / math.sqrt(self.hidden_size)
+			self.h_init.data.uniform_(-stdv, stdv)
+
+	def forward(self, incoming, length, post, post_length, h_init=None):
+		batch_size = incoming.shape[1]
+		seqlen = incoming.shape[0]
+		if h_init is None:
+			h_init = self.getInitialParameter(batch_size)
+		else:
+			h_init = torch.unsqueeze(h_init, 0)
+		h_now = h_init[0]
+		hs = []
+		attn_weights = []
+
+		for i in range(seqlen):
+			query = self.attn_query(h_now)
+			attn_weight = maskedSoftmax((query.unsqueeze(0) * post).sum(-1), post_length)
+			context = (attn_weight.unsqueeze(-1) * post).sum(0)
+
+			h_now = self.cell_forward(torch.cat([incoming[i], context], dim=-1), h_now) \
+				* Tensor((length > np.ones(batch_size) * i).astype(float)).unsqueeze(-1)
+			hs.append(h_now)
+			attn_weights.append(attn_weight)
+
+		return h_now, hs, attn_weights
+
+	def init_forward(self, batch_size, post, post_length, h_init=None):
+		if h_init is None:
+			h_init = self.getInitialParameter(batch_size)
+		else:
+			h_init = torch.unsqueeze(h_init, 0)
+		h_now = h_init[0]
+
+		def nextStep(incoming, stopmask):
+			nonlocal h_now, post, post_length
+			query = self.attn_query(h_now)
+			attn_weight = maskedSoftmax((query.unsqueeze(0) * post).sum(-1), post_length)
+			context = (attn_weight.unsqueeze(-1) * post).sum(0)
+
+			h_now = self.cell_forward(torch.cat([incoming, context], dim=-1), h_now) \
+				* (1 - stopmask).float().unsqueeze(-1)
+			return h_now, attn_weight
+
+		return nextStep
+
+	def cell_forward(self, incoming, h):
+		return F_GRUCell( \
+				incoming, h, \
+				self.GRU.weight_ih_l0, self.GRU.weight_hh_l0, \
+				self.GRU.bias_ih_l0, self.GRU.bias_hh_l0, \
+		)
+
+class SingleSelfAttnGRU(nn.Module):
+	def __init__(self, input_size, hidden_size, attn_wait=3, initpara=True):
+		super().__init__()
+
+		self.input_size, self.hidden_size = \
+				input_size, hidden_size
+		self.attn_wait = attn_wait
+		self.decoderGRU = GRU(input_size + hidden_size, hidden_size, 1)
+		self.encoderGRU = GRU(input_size, hidden_size, 1)
+
+		self.attn_query = nn.Linear(hidden_size, hidden_size)
+
+		#self.attn_null = Parameter(torch.Tensor(1, 1, hidden_size))
+		#stdv = 1.0 / math.sqrt(self.hidden_size)
+		#self.attn_null.data.uniform_(-stdv, stdv)
+
+		if initpara:
+			self.eh_init = Parameter(torch.Tensor(1, 1, hidden_size))
+			stdv = 1.0 / math.sqrt(self.hidden_size)
+			self.eh_init.data.uniform_(-stdv, stdv)
+			self.dh_init = Parameter(torch.Tensor(1, 1, hidden_size))
+			self.dh_init.data.uniform_(-stdv, stdv)
+
+	def forward(self, incoming, length, eh_init=None, dh_init=None, need_h=False, need_attn_weight=False):
+		batch_size = incoming.shape[1]
+		seqlen = incoming.shape[0]
+
+		if eh_init is None:
+			eh_init = self.eh_init.repeat(1, batch_size, 1)
+		else:
+			eh_init = torch.unsqueeze(eh_init, 0)
+		if dh_init is None:
+			dh_init = self.dh_init.repeat(1, batch_size, 1)
+		else:
+			dh_init = torch.unsqueeze(dh_init, 0)
+
+		h_history = None
+		eh = eh_init[0]
+		dh = dh_init[0]
+		dhs = []
+		attn_weights = []
+		#attn_null = self.attn_null.repeat(1, batch_size, 1)
+		for i in range(seqlen):
+			if i <= self.attn_wait:
+				context = zeros(batch_size, self.hidden_size)
+			else:
+				query = self.attn_query(dh)
+				h_wait = h_history[:self.attn_wait]
+				attn_weight = (query.unsqueeze(0) * h_wait).sum(-1).softmax(0)
+				attn_weights.append(attn_weight)
+				context = (attn_weight.unsqueeze(-1) * h_wait).sum(0)
+			dh = F_GRUCell(
+				torch.cat([incoming[i], context], dim=-1), dh,
+				self.decoderGRU.weight_ih_l0, self.decoderGRU.weight_hh_l0,
+				self.decoderGRU.bias_ih_l0, self.decoderGRU.bias_hh_l0
+			) * Tensor((length > np.ones(batch_size) * i).astype(float)).unsqueeze(-1)
+
+			eh = F_GRUCell(
+				incoming[i], eh,
+				self.encoderGRU.weight_ih_l0, self.encoderGRU.weight_hh_l0,
+				self.encoderGRU.bias_ih_l0, self.encoderGRU.bias_hh_l0
+			) * Tensor((length > np.ones(batch_size) * i).astype(float)).unsqueeze(-1)
+
+			h_history = eh.unsqueeze(0) if h_history is None else torch.cat([h_history, eh.unsqueeze(0)], dim=0)
+			dhs.append(dh)
+
+		h_n = dh
+		if need_h:
+			h = torch.stack(dhs, 0)
+			if need_attn_weight:
+				return h, h_n, attn_weights
+			else:
+				return h, h_n
+		else:
+			return h_n
+
+	def init_forward(self, batch_size, eh_init=None, dh_init=None):
+		if eh_init is None:
+			eh_init = self.eh_init.repeat(1, batch_size, 1)
+		else:
+			eh_init = torch.unsqueeze(eh_init, 0)
+		if dh_init is None:
+			dh_init = self.dh_init.repeat(1, batch_size, 1)
+		else:
+			dh_init = torch.unsqueeze(dh_init, 0)
+
+		h_history = None
+		dh = dh_init[0]
+		eh = eh_init[0]
+		#attn_null = self.attn_null.repeat(1, batch_size, 1)
+
+		def nextStep(incoming, stopmask):
+			nonlocal h_history, eh, dh
+
+			if h_history is None or h_history.shape[0] <= self.attn_wait:
+				context = zeros(batch_size, self.hidden_size)
+			else:
+				query = self.attn_query(dh)
+				h_wait = h_history[:self.attn_wait]
+				attn_weight = (query.unsqueeze(0) * h_wait).sum(-1).softmax(0)
+				context = (attn_weight.unsqueeze(-1) * h_wait).sum(0)
+
+			dh = F_GRUCell(
+				torch.cat([incoming, context], dim=-1), dh,
+				self.decoderGRU.weight_ih_l0, self.decoderGRU.weight_hh_l0,
+				self.decoderGRU.bias_ih_l0, self.decoderGRU.bias_hh_l0
+			) * (1 - stopmask).float().unsqueeze(-1)
+
+			eh = F_GRUCell(
+				incoming, eh,
+				self.encoderGRU.weight_ih_l0, self.encoderGRU.weight_hh_l0,
+				self.encoderGRU.bias_ih_l0, self.encoderGRU.bias_hh_l0
+			) * (1 - stopmask).float().unsqueeze(-1)
+			h_history = eh.unsqueeze(0) if h_history is None else torch.cat([h_history, eh.unsqueeze(0)], dim=0)
+			return dh
+
+		return nextStep
