@@ -9,12 +9,13 @@ import numpy as np
 
 from .cuda_helper import cuda, Tensor
 from .anneal_helper import AnnealHelper, AnnealParameter
+from .storage import Storage
 
 class BaseModel():
 	def __init__(self, param, net, optimizerList, checkpoint_manager, helperList=None):
 		self.param = param
 		self.args = args = param.args
-		self.param.other_weights = {}
+		self.param.other_weights = Storage()
 
 		self.net = net
 
@@ -87,6 +88,12 @@ class BaseModel():
 			if not a.over():
 				return False
 		return True
+
+	def zero_grad(self):
+		for p in self.net.parameters():
+			if p.grad is not None:
+				p.grad.detach_()
+				p.grad.zero_()
 
 	def save_checkpoint(self, value=None, filename=None):
 		args = self.args

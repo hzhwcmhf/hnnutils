@@ -7,7 +7,9 @@ from torch.nn import Parameter
 from torch.nn.modules.rnn import GRU
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
-from .cuda_helper import zeros, Tensor
+from .cuda_helper import zeros, Tensor, LongTensor
+from .gumbel import gumbel_max
+from .storage import Storage
 
 F_GRUCell = torch._C._VariableFunctions.gru_cell
 
@@ -66,6 +68,10 @@ def generateMask(seqlen, length, type=int):
 def maskedSoftmax(data, length):
 	mask = generateMask(data.shape[0], length)
 	return data.masked_fill(mask == 0, -1e9).softmax(dim=0)
+
+def maskedLogSoftmax(data, length):
+	mask = generateMask(data.shape[0], length)
+	return torch.log_softmax(data.masked_fill(mask == 0, -1e9), dim=0)
 
 class MyGRU(nn.Module):
 	def __init__(self, input_size, hidden_size, layers=1, bidirectional=False, initpara=True):
@@ -163,13 +169,67 @@ class SingleGRU(nn.Module):
 				self.GRU.bias_ih_l0, self.GRU.bias_hh_l0, \
 		)
 
+	def freerun(self, inp, wLinearLayerCallback, mode='max', input_callback=None):
+		# batch_size, dm, embLayer, max_sent_length, [init_h]
+		# w emb length
+		batch_size = inp.batch_size
+		dm = inp.dm
+
+		first_emb = inp.embLayer(LongTensor([dm.go_id])).repeat(batch_size, 1)
+
+		gen = Storage()
+		gen.w_pro = []
+		gen.w_o = []
+		gen.emb = []
+		flag = zeros(batch_size).byte()
+		EOSmet = []
+
+		next_emb = first_emb
+		nextStep = self.init_forward(batch_size, inp.get("init_h", None))
+
+		for i in range(inp.max_sent_length):
+			now = next_emb
+			if input_callback:
+				now = input_callback(i, now)
+
+			gru_h = nextStep(now, flag)
+			w = wLinearLayerCallback(gru_h)
+			gen.w_pro.append(w)
+			if mode == "max":
+				w = torch.argmax(w[:,2:], dim=1) + 2
+				next_emb = inp.embLayer(w)
+			elif mode == "gumbel":
+				w_onehot, w = gumbel_max(w[:,2:], 1, 1)
+				w = w + 2
+				next_emb = torch.sum(torch.unsqueeze(w_onehot, -1) * inp.embLayer.weight[2:], 1)
+			gen.w_o.append(w)
+			gen.emb.append(next_emb)
+
+			EOSmet.append(flag)
+			flag = flag | (w == dm.eos_id)
+			if torch.sum(flag).detach().cpu().numpy() == batch_size:
+				break
+
+		EOSmet = 1-torch.stack(EOSmet)
+		gen.w_o = torch.stack(gen.w_o) * EOSmet.long()
+		gen.emb = torch.stack(gen.emb) * EOSmet.float().unsqueeze(-1)
+		gen.length = torch.sum(EOSmet, 0).detach().cpu().numpy()
+
+		return gen
+
+
 class SingleAttnGRU(nn.Module):
-	def __init__(self, input_size, hidden_size, post_size, initpara=True):
+	def __init__(self, input_size, hidden_size, post_size, initpara=True, gru_input_attn=False):
 		super().__init__()
 
 		self.input_size, self.hidden_size, self.post_size = \
 			input_size, hidden_size, post_size
-		self.GRU = GRU(input_size + post_size, hidden_size, 1)
+		self.gru_input_attn = gru_input_attn
+
+		if self.gru_input_attn:
+			self.GRU = GRU(input_size + post_size, hidden_size, 1)
+		else:
+			self.GRU = GRU(input_size, hidden_size, 1)
 
 		self.attn_query = nn.Linear(hidden_size, post_size)
 
@@ -188,15 +248,21 @@ class SingleAttnGRU(nn.Module):
 		h_now = h_init[0]
 		hs = []
 		attn_weights = []
+		context = zeros(batch_size, self.post_size)
 
 		for i in range(seqlen):
+			if self.gru_input_attn:
+				h_now = self.cell_forward(torch.cat([incoming[i], context], last_dim=-1), h_now) \
+					* Tensor((length > np.ones(batch_size) * i).astype(float)).unsqueeze(-1)
+			else:
+				h_now = self.cell_forward(incoming[i], h_now) \
+					* Tensor((length > np.ones(batch_size) * i).astype(float)).unsqueeze(-1)
+
 			query = self.attn_query(h_now)
 			attn_weight = maskedSoftmax((query.unsqueeze(0) * post).sum(-1), post_length)
 			context = (attn_weight.unsqueeze(-1) * post).sum(0)
 
-			h_now = self.cell_forward(torch.cat([incoming[i], context], dim=-1), h_now) \
-				* Tensor((length > np.ones(batch_size) * i).astype(float)).unsqueeze(-1)
-			hs.append(h_now)
+			hs.append(torch.cat([h_now, context], dim=-1))
 			attn_weights.append(attn_weight)
 
 		return h_now, hs, attn_weights
@@ -207,16 +273,22 @@ class SingleAttnGRU(nn.Module):
 		else:
 			h_init = torch.unsqueeze(h_init, 0)
 		h_now = h_init[0]
+		context = zeros(batch_size, self.post_size)
 
 		def nextStep(incoming, stopmask):
-			nonlocal h_now, post, post_length
+			nonlocal h_now, post, post_length, context
+			
+			if self.gru_input_attn:
+				h_now = self.cell_forward(torch.cat([incoming, context], dim=-1), h_now) \
+					* (1 - stopmask).float().unsqueeze(-1)
+			else:
+				h_now = self.cell_forward(incoming, h_now) * (1 - stopmask).float().unsqueeze(-1)
+
 			query = self.attn_query(h_now)
 			attn_weight = maskedSoftmax((query.unsqueeze(0) * post).sum(-1), post_length)
 			context = (attn_weight.unsqueeze(-1) * post).sum(0)
 
-			h_now = self.cell_forward(torch.cat([incoming, context], dim=-1), h_now) \
-				* (1 - stopmask).float().unsqueeze(-1)
-			return h_now, attn_weight
+			return torch.cat([h_now, context], dim=-1), attn_weight
 
 		return nextStep
 
@@ -263,7 +335,7 @@ class SingleSelfAttnGRU(nn.Module):
 		else:
 			dh_init = torch.unsqueeze(dh_init, 0)
 
-		h_history = None
+		h_history = []
 		eh = eh_init[0]
 		dh = dh_init[0]
 		dhs = []
@@ -290,7 +362,7 @@ class SingleSelfAttnGRU(nn.Module):
 				self.encoderGRU.bias_ih_l0, self.encoderGRU.bias_hh_l0
 			) * Tensor((length > np.ones(batch_size) * i).astype(float)).unsqueeze(-1)
 
-			h_history = eh.unsqueeze(0) if h_history is None else torch.cat([h_history, eh.unsqueeze(0)], dim=0)
+			h_history = eh.unsqueeze(0) if not h_history else torch.cat([h_history, eh.unsqueeze(0)], dim=0)
 			dhs.append(dh)
 
 		h_n = dh
@@ -313,7 +385,7 @@ class SingleSelfAttnGRU(nn.Module):
 		else:
 			dh_init = torch.unsqueeze(dh_init, 0)
 
-		h_history = None
+		h_history = []
 		dh = dh_init[0]
 		eh = eh_init[0]
 		#attn_null = self.attn_null.repeat(1, batch_size, 1)
@@ -340,7 +412,7 @@ class SingleSelfAttnGRU(nn.Module):
 				self.encoderGRU.weight_ih_l0, self.encoderGRU.weight_hh_l0,
 				self.encoderGRU.bias_ih_l0, self.encoderGRU.bias_hh_l0
 			) * (1 - stopmask).float().unsqueeze(-1)
-			h_history = eh.unsqueeze(0) if h_history is None else torch.cat([h_history, eh.unsqueeze(0)], dim=0)
+			h_history = eh.unsqueeze(0) if not h_history else torch.cat([h_history, eh.unsqueeze(0)], dim=0)
 			return dh
 
 		return nextStep

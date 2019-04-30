@@ -3,14 +3,21 @@ import torch
 import torch.nn.functional as F
 from torch.autograd import Variable, Function
 
-from .cuda_helper import Tensor
+from .cuda_helper import Tensor, cuda
+
+def gumbel_softmax(inp, alpha, beta):
+	g = Tensor(inp.size()).uniform_(0.0001, 0.9999)
+	g = Variable(-torch.log(-torch.log(g)))
+	inp_g = F.softmax((F.log_softmax(inp, dim=-1) + g * alpha) * beta, dim=-1)
+	return inp_g
 
 def gumbel_max(inp, alpha, beta):
-	assert len(inp.size()) == 2
 	g = Tensor(inp.size()).uniform_(0.0001, 0.9999)
 	g = Variable(-torch.log(-torch.log(g)))
 	inp_g = F.softmax((F.log_softmax(inp, dim=1) + g * alpha) * beta, dim=1)
-	return StraightThrough.apply(inp_g)
+	shape = inp_g.shape
+	output, idx = StraightThrough.apply(inp_g.reshape(-1, shape[-1]))
+	return output.reshape(*shape), idx.reshape(*(list(shape[:-1]) + [-1]))
 
 def gumbel_max_binary(inp, alpha, beta):
 	inp = torch.cat([1-inp, inp], 1)
@@ -33,4 +40,3 @@ class StraightThrough(Function):
 	def backward(ctx, grad_output, _):
 		#inp = ctx.saved_variables
 		return grad_output.clone()
-    
