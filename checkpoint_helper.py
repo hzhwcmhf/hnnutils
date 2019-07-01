@@ -114,7 +114,7 @@ class CheckpointManager:
 
 	def state_dict(self):
 		return {key: value for key, value in self.__dict__.items() if key not in \
-					{"log_dir", "model_dir", "checkpoint_steps", \
+					{"log_name", "model_dir", "checkpoint_steps", \
 					"checkpoint_max_to_keep", "checkpoint_list"}}
 
 	def load_state_dict(self, state_dict):

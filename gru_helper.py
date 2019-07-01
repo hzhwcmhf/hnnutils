@@ -7,7 +7,7 @@ from torch.nn import Parameter
 from torch.nn.modules.rnn import GRU
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
-from .cuda_helper import zeros, Tensor, LongTensor
+from .cuda_helper import zeros, Tensor, LongTensor, cuda
 from .gumbel import gumbel_max
 from .storage import Storage
 
@@ -114,7 +114,163 @@ class MyGRU(nn.Module):
 		else:
 			return h_n, None
 
-class SingleGRU(nn.Module):
+class DecoderRNN(nn.Module):
+	def __init__(self):
+		super().__init__()
+
+	def _freerun(self, inp, nextStep, wLinearLayerCallback, mode='max', input_callback=None, no_unk=True):
+		# inp contains: batch_size, dm, embLayer, max_sent_length, [init_h]
+		# input_callback(i, embedding):   if you want to change word embedding at pos i, override this function
+		# nextStep(embedding, flag):  pass embedding to RNN and get gru_h, flag indicates i th sentence is end when flag[i]==1
+		# wLinearLayerCallback(gru_h): input gru_h and give a probability distribution on vocablist
+
+		# output: w_o emb length
+
+		start_id = inp.dm.go_id if no_unk else 0
+
+		batch_size = inp.batch_size
+		dm = inp.dm
+
+		first_emb = inp.embLayer(LongTensor([dm.go_id])).repeat(batch_size, 1)
+
+		gen = Storage()
+		gen.w_pro = []
+		gen.w_o = []
+		gen.emb = []
+		flag = zeros(batch_size).byte()
+		EOSmet = []
+
+		next_emb = first_emb
+		#nextStep = self.init_forward(batch_size, inp.get("init_h", None))
+
+		for i in range(inp.max_sent_length):
+			now = next_emb
+			if input_callback:
+				now = input_callback(i, now)
+
+			gru_h = nextStep(now, flag)
+			w = wLinearLayerCallback(gru_h)
+			gen.w_pro.append(w.softmax(dim=-1))
+			if mode == "max":
+				w = torch.argmax(w[:, start_id:], dim=1) + start_id
+				#TODO: didn't consider copynet
+				next_emb = inp.embLayer(w)
+			elif mode == "gumbel":
+				w_onehot, w = gumbel_max(w[:, start_id:], 1, 1)
+				w = w + start_id
+				#TODO: didn't consider copynet
+				next_emb = torch.sum(torch.unsqueeze(w_onehot, -1) * inp.embLayer.weight[start_id:], 1)
+			gen.w_o.append(w)
+			gen.emb.append(next_emb)
+
+			EOSmet.append(flag)
+			flag = flag | (w == dm.eos_id)
+			if torch.sum(flag).detach().cpu().numpy() == batch_size:
+				break
+
+		EOSmet = 1-torch.stack(EOSmet)
+		gen.w_o = torch.stack(gen.w_o) * EOSmet.long()
+		gen.emb = torch.stack(gen.emb) * EOSmet.float().unsqueeze(-1)
+		gen.length = torch.sum(EOSmet, 0).detach().cpu().numpy()
+
+		return gen
+
+	def _beamsearch(self, inp, top_k, nextStep, wLinearLayerCallback, input_callback=None, no_unk=True, length_penalty=0.7):
+		# inp contains: batch_size, dm, embLayer, max_sent_length, [init_h]
+		# input_callback(i, embedding):   if you want to change word embedding at pos i, override this function
+		# nextStep(embedding, flag):  pass embedding to RNN and get gru_h, flag indicates i th sentence is end when flag[i]==1
+		# wLinearLayerCallback(gru_h): input gru_h and give logits on vocablist
+
+		# output: w_o emb length
+
+		#start_id = inp.dm.go_id if no_unk else 0
+
+		batch_size = inp.batch_size
+		dm = inp.dm
+
+		first_emb = inp.embLayer(LongTensor([dm.go_id])).repeat(batch_size, top_k, 1)
+
+		w_pro = []
+		w_o = []
+		emb = []
+		flag = zeros(batch_size, top_k).byte()
+		EOSmet = []
+		score = zeros(batch_size, top_k)
+		score[:, 1:] = -1e9
+		now_length = zeros(batch_size, top_k)
+		back_index = []
+		regroup = LongTensor([i for i in range(top_k)]).repeat(batch_size, 1)
+
+		next_emb = first_emb
+		#nextStep = self.init_forward(batch_size, inp.get("init_h", None))
+
+		for i in range(inp.max_sent_length):
+			now = next_emb
+			if input_callback:
+				now = input_callback(i, now)
+
+			gru_h, _ = nextStep(now, flag, regroup=regroup) # batch_size, top_k, hidden_size
+			w = wLinearLayerCallback(gru_h) # batch_size, top_k, vocab_size
+
+			if no_unk:
+				w[:, :, dm.unk_id] = -1e9
+			w = w.log_softmax(dim=-1)
+			w_pro.append(w.exp())
+
+			new_score = (score.unsqueeze(-1) + w * (1-flag.float()).unsqueeze(-1)) / ((now_length.float() + 1 - flag.float()).unsqueeze(-1) ** length_penalty)
+			new_score[:, :, 1:] = new_score[:, :, 1:] - flag.float().unsqueeze(-1) * 1e9
+			_, index = new_score.reshape(batch_size, -1).topk(top_k, dim=-1, largest=True, sorted=True) # batch_size, top_k
+
+			new_score = (score.unsqueeze(-1) + w * (1-flag.float()).unsqueeze(-1)).reshape(batch_size, -1)
+			# assert (regroup >= new_score.shape[1]).sum().tolist() == 0
+			score = torch.gather(new_score, dim=1, index=index)
+
+			vocab_size = w.shape[-1]
+			regroup = index / vocab_size # batch_size, top_k
+			back_index.append(regroup)
+			w = torch.fmod(index, vocab_size) # batch_size, top_k
+
+			# assert (regroup >= flag.shape[1]).sum().tolist() == 0
+			flag = torch.gather(flag, dim=1, index=regroup)
+			# assert (regroup >= now_length.shape[1]).sum().tolist() == 0
+			now_length = torch.gather(now_length, dim=1, index=regroup) + 1 - flag.float()
+
+			w_x = w.clone()
+			w_x[w_x >= dm.vocab_size] = dm.unk_id
+			#w_x = cuda(w_x)
+
+			next_emb = inp.embLayer(w_x)
+			w_o.append(w)
+			emb.append(next_emb)
+
+			EOSmet.append(flag)
+
+			flag = flag | (w == dm.eos_id)
+			if torch.sum(flag).detach().cpu().numpy() == batch_size * top_k:
+				break
+
+		#back tracking
+		gen = Storage()
+		back_EOSmet = []
+		gen.w_o = []
+		gen.emb = []
+		now_index = LongTensor([i for i in range(top_k)]).repeat(batch_size, 1)
+
+		for i, index in reversed(list(enumerate(back_index))):
+			gen.w_o.append(torch.gather(w_o[i], dim=1, index=now_index))
+			gen.emb.append(torch.gather(emb[i], dim=1, index=now_index.unsqueeze(-1).expand_as(emb[i])))
+			back_EOSmet.append(torch.gather(EOSmet[i], dim=1, index=now_index))
+			now_index = torch.gather(index, dim=1, index=now_index)
+
+		back_EOSmet = 1-torch.stack(list(reversed(back_EOSmet)))
+		gen.w_o = torch.stack(list(reversed(gen.w_o))) * back_EOSmet.long()
+		gen.emb = torch.stack(list(reversed(gen.emb))) * back_EOSmet.float().unsqueeze(-1)
+		gen.length = torch.sum(back_EOSmet, 0).detach().cpu().numpy()
+
+		return gen
+
+
+class SingleGRU(DecoderRNN):
 	def __init__(self, input_size, hidden_size, initpara=True):
 		super().__init__()
 
@@ -169,56 +325,11 @@ class SingleGRU(nn.Module):
 				self.GRU.bias_ih_l0, self.GRU.bias_hh_l0, \
 		)
 
-	def freerun(self, inp, wLinearLayerCallback, mode='max', input_callback=None):
-		# batch_size, dm, embLayer, max_sent_length, [init_h]
-		# w emb length
-		batch_size = inp.batch_size
-		dm = inp.dm
+	def freerun(self, inp, wLinearLayerCallback, mode='max', input_callback=None, no_unk=True):
+		nextStep = self.init_forward(inp.batch_size, inp.get("init_h", None))
+		return self._freerun(inp, nextStep, wLinearLayerCallback, mode, input_callback, no_unk)
 
-		first_emb = inp.embLayer(LongTensor([dm.go_id])).repeat(batch_size, 1)
-
-		gen = Storage()
-		gen.w_pro = []
-		gen.w_o = []
-		gen.emb = []
-		flag = zeros(batch_size).byte()
-		EOSmet = []
-
-		next_emb = first_emb
-		nextStep = self.init_forward(batch_size, inp.get("init_h", None))
-
-		for i in range(inp.max_sent_length):
-			now = next_emb
-			if input_callback:
-				now = input_callback(i, now)
-
-			gru_h = nextStep(now, flag)
-			w = wLinearLayerCallback(gru_h)
-			gen.w_pro.append(w)
-			if mode == "max":
-				w = torch.argmax(w[:,2:], dim=1) + 2
-				next_emb = inp.embLayer(w)
-			elif mode == "gumbel":
-				w_onehot, w = gumbel_max(w[:,2:], 1, 1)
-				w = w + 2
-				next_emb = torch.sum(torch.unsqueeze(w_onehot, -1) * inp.embLayer.weight[2:], 1)
-			gen.w_o.append(w)
-			gen.emb.append(next_emb)
-
-			EOSmet.append(flag)
-			flag = flag | (w == dm.eos_id)
-			if torch.sum(flag).detach().cpu().numpy() == batch_size:
-				break
-
-		EOSmet = 1-torch.stack(EOSmet)
-		gen.w_o = torch.stack(gen.w_o) * EOSmet.long()
-		gen.emb = torch.stack(gen.emb) * EOSmet.float().unsqueeze(-1)
-		gen.length = torch.sum(EOSmet, 0).detach().cpu().numpy()
-
-		return gen
-
-
-class SingleAttnGRU(nn.Module):
+class SingleAttnGRU(DecoderRNN):
 	def __init__(self, input_size, hidden_size, post_size, initpara=True, gru_input_attn=False):
 		super().__init__()
 
@@ -237,6 +348,9 @@ class SingleAttnGRU(nn.Module):
 			self.h_init = Parameter(torch.Tensor(1, 1, hidden_size))
 			stdv = 1.0 / math.sqrt(self.hidden_size)
 			self.h_init.data.uniform_(-stdv, stdv)
+
+	def getInitialParameter(self, batch_size):
+		return self.h_init.repeat(1, batch_size, 1)
 
 	def forward(self, incoming, length, post, post_length, h_init=None):
 		batch_size = incoming.shape[1]
@@ -277,7 +391,7 @@ class SingleAttnGRU(nn.Module):
 
 		def nextStep(incoming, stopmask):
 			nonlocal h_now, post, post_length, context
-			
+
 			if self.gru_input_attn:
 				h_now = self.cell_forward(torch.cat([incoming, context], dim=-1), h_now) \
 					* (1 - stopmask).float().unsqueeze(-1)
@@ -292,14 +406,56 @@ class SingleAttnGRU(nn.Module):
 
 		return nextStep
 
+	def init_forward_3d(self, batch_size, top_k, post, post_length, h_init=None):
+		if h_init is None:
+			h_init = self.getInitialParameter(batch_size)
+		else:
+			h_init = torch.unsqueeze(h_init, 0)
+		h_now = h_init[0].unsqueeze(1).expand(-1, top_k, -1) # batch_size * top_k * hidden_size
+		context = zeros(batch_size, self.post_size)
+
+		post = post.unsqueeze(-2)
+		#post_length = np.tile(np.expand_dims(post_length, 1), (1, top_k, 1))
+
+		def nextStep(incoming, stopmask, regroup=None):
+			nonlocal h_now, post, post_length, context
+			h_now = torch.gather(h_now, 1, regroup.unsqueeze(-1).repeat(1, 1, h_now.shape[-1]))
+
+			if self.gru_input_attn:
+				context = torch.gather(context, 1, regroup.unsqueeze(-1).repeat(1, 1, context.shape[-1]))
+				h_now = self.cell_forward(torch.cat([incoming, context], dim=-1), h_now) \
+					* (1 - stopmask).float().unsqueeze(-1)
+			else:
+				h_now = self.cell_forward(incoming, h_now) * (1 - stopmask).float().unsqueeze(-1) # batch_size * top_k * hidden_size
+
+			query = self.attn_query(h_now) # batch_size * top_k * post_size
+
+			mask = generateMask(post.shape[0], post_length).unsqueeze(-1)
+			attn_weight = (query.unsqueeze(0) * post).sum(-1).masked_fill(mask==0, -1e9).softmax(0) # post_len * batch_size * top_k
+			context = (attn_weight.unsqueeze(-1) * post).sum(0)
+
+			return torch.cat([h_now, context], dim=-1), attn_weight
+
+		return nextStep
+
 	def cell_forward(self, incoming, h):
+		shape = h.shape
 		return F_GRUCell( \
-				incoming, h, \
+				incoming.reshape(-1, incoming.shape[-1]), h.reshape(-1, h.shape[-1]), \
 				self.GRU.weight_ih_l0, self.GRU.weight_hh_l0, \
 				self.GRU.bias_ih_l0, self.GRU.bias_hh_l0, \
-		)
+		).reshape(*shape)
 
-class SingleSelfAttnGRU(nn.Module):
+	def freerun(self, inp, wLinearLayerCallback, mode='max', input_callback=None, no_unk=True):
+		nextStep = self.init_forward(inp.batch_size, inp.post, inp.post_length, inp.get("init_h", None))
+		return self._freerun(inp, nextStep, wLinearLayerCallback, mode, input_callback, no_unk)
+
+	def beamsearch(self, inp, top_k, wLinearLayerCallback, input_callback=None, no_unk=True, length_penalty=0.7):
+		nextStep = self.init_forward_3d(inp.batch_size, top_k, inp.post, inp.post_length, inp.get("init_h", None))
+		return self._beamsearch(inp, top_k, nextStep, wLinearLayerCallback, input_callback, no_unk, length_penalty)
+
+
+class SingleSelfAttnGRU(DecoderRNN):
 	def __init__(self, input_size, hidden_size, attn_wait=3, initpara=True):
 		super().__init__()
 
@@ -416,3 +572,7 @@ class SingleSelfAttnGRU(nn.Module):
 			return dh
 
 		return nextStep
+
+	def freerun(self, inp, wLinearLayerCallback, mode='max', input_callback=None, no_unk=True):
+		nextStep = self.init_forward(inp.batch_size, inp.get("eh_init", None), inp.get("dh_init", None))
+		return self._freerun(inp, nextStep, wLinearLayerCallback, mode, input_callback, no_unk)

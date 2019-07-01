@@ -14,3 +14,4 @@ from .gumbel import gumbel_max, gumbel_max_binary, gumbel_softmax
 from .scheduler_helper import ReduceLROnLambda
 from .checkpoint_helper import CheckpointManager
 from .bn_helper import SequenceBatchNorm
+from .mmd import gaussMMD
