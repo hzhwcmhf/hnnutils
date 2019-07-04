@@ -8,7 +8,7 @@ from torch.nn.modules.rnn import GRU
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 
 from .cuda_helper import zeros, Tensor, LongTensor, cuda
-from .gumbel import gumbel_max
+from .gumbel import gumbel_max, gumbel_max_with_mask
 from .storage import Storage
 
 F_GRUCell = torch._C._VariableFunctions.gru_cell
@@ -118,7 +118,7 @@ class DecoderRNN(nn.Module):
 	def __init__(self):
 		super().__init__()
 
-	def _freerun(self, inp, nextStep, wLinearLayerCallback, mode='max', input_callback=None, no_unk=True):
+	def _freerun(self, inp, nextStep, wLinearLayerCallback, mode='max', input_callback=None, no_unk=True, top_k=10):
 		# inp contains: batch_size, dm, embLayer, max_sent_length, [init_h]
 		# input_callback(i, embedding):   if you want to change word embedding at pos i, override this function
 		# nextStep(embedding, flag):  pass embedding to RNN and get gru_h, flag indicates i th sentence is end when flag[i]==1
@@ -149,17 +149,26 @@ class DecoderRNN(nn.Module):
 				now = input_callback(i, now)
 
 			gru_h = nextStep(now, flag)
+			if isinstance(gru_h, tuple):
+				gru_h = gru_h[0]
+
 			w = wLinearLayerCallback(gru_h)
 			gen.w_pro.append(w.softmax(dim=-1))
+			#TODO: didn't consider copynet
 			if mode == "max":
 				w = torch.argmax(w[:, start_id:], dim=1) + start_id
-				#TODO: didn't consider copynet
 				next_emb = inp.embLayer(w)
-			elif mode == "gumbel":
-				w_onehot, w = gumbel_max(w[:, start_id:], 1, 1)
-				w = w + start_id
-				#TODO: didn't consider copynet
+			elif mode == "gumbel" or mode == "sample":
+				w_onehot = gumbel_max(w[:, start_id:])
+				w = torch.argmax(w_onehot, dim=1) + start_id
 				next_emb = torch.sum(torch.unsqueeze(w_onehot, -1) * inp.embLayer.weight[start_id:], 1)
+			elif mode == "samplek":
+				_, index = w[:, start_id:].topk(top_k, dim=-1, largest=True, sorted=True) # batch_size, top_k
+				mask = torch.zeros_like(w[:, start_id:]).scatter_(-1, index, 1.0)
+				w_onehot = gumbel_max_with_mask(w[:, start_id:], mask)
+				w = torch.argmax(w_onehot, dim=1) + start_id
+				next_emb = torch.sum(torch.unsqueeze(w_onehot, -1) * inp.embLayer.weight[start_id:], 1)
+
 			gen.w_o.append(w)
 			gen.emb.append(next_emb)
 
@@ -209,7 +218,10 @@ class DecoderRNN(nn.Module):
 			if input_callback:
 				now = input_callback(i, now)
 
-			gru_h, _ = nextStep(now, flag, regroup=regroup) # batch_size, top_k, hidden_size
+			gru_h = nextStep(now, flag, regroup=regroup) # batch_size, top_k, hidden_size
+			if isinstance(gru_h, tuple):
+				gru_h = gru_h[0]
+
 			w = wLinearLayerCallback(gru_h) # batch_size, top_k, vocab_size
 
 			if no_unk:
@@ -446,9 +458,9 @@ class SingleAttnGRU(DecoderRNN):
 				self.GRU.bias_ih_l0, self.GRU.bias_hh_l0, \
 		).reshape(*shape)
 
-	def freerun(self, inp, wLinearLayerCallback, mode='max', input_callback=None, no_unk=True):
+	def freerun(self, inp, wLinearLayerCallback, mode='max', input_callback=None, no_unk=True, top_k=10):
 		nextStep = self.init_forward(inp.batch_size, inp.post, inp.post_length, inp.get("init_h", None))
-		return self._freerun(inp, nextStep, wLinearLayerCallback, mode, input_callback, no_unk)
+		return self._freerun(inp, nextStep, wLinearLayerCallback, mode, input_callback, no_unk, top_k=top_k)
 
 	def beamsearch(self, inp, top_k, wLinearLayerCallback, input_callback=None, no_unk=True, length_penalty=0.7):
 		nextStep = self.init_forward_3d(inp.batch_size, top_k, inp.post, inp.post_length, inp.get("init_h", None))
