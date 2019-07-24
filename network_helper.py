@@ -4,9 +4,10 @@ from collections import OrderedDict
 
 from torch import nn
 from torch.nn import Parameter
+from .module_helper import BaseModule
 
 # pylint: disable=W0223, W0221
-class BaseNetwork(nn.Module):
+class BaseNetwork(BaseModule):
 	def __init__(self, param, collection_name=None):
 		super().__init__()
 		args = param.args

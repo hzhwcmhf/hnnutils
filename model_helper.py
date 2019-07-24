@@ -43,9 +43,11 @@ class BaseModel():
 			Tensor(1)
 			logging.info("cuda initialized")
 
+		self.last_args = None
 		if args.restore is not None:
 			checkpoint = self.checkpoint_manager.restore(args.restore)
 			diff = args - checkpoint["args"]
+			self.last_args = checkpoint['args']
 			if diff:
 				logging.info("Args differences\n%s", json.dumps(diff, indent=2))
 			self.now_batch = checkpoint['now_batch']

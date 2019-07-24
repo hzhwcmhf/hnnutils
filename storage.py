@@ -8,7 +8,7 @@ class Storage(dict):
 		if key in self:
 			return self[key]
 		else:
-			return getattr(super(Storage, self), key)
+			raise AttributeError("This storage has no attribute %s" % key)
 
 	def __setattr__(self, key, value):
 		self[key] = value
