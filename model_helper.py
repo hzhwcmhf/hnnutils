@@ -118,19 +118,18 @@ class BaseModel():
 	def checkgrad(self):
 		logging.info("checkgrad:")
 		for name, p in self.net.named_parameters():
-			if p.grad is not None and p.abs().sum().tolist() > 0:
+			if p.grad is not None and p.grad.abs().sum().tolist() > 0:
 				logging.info("\t%s", name)
 
 def get_mean(loss_arr, key):
-	if key in loss_arr[0]:
-		return np.mean(list(map(lambda x: x[key].detach().cpu().numpy(), loss_arr)))
-	else:
-		return 0
+	return np.mean(list(map(lambda x: x[key].detach().cpu().numpy(), loss_arr)))
 
 def storage_to_list(incoming):
-	for i, j in incoming.items():
+	for i, j in incoming.listitems():
 		if "tolist" in dir(j):
 			incoming[i] = j.tolist()
+		elif isinstance(j, (float, int)):
+			incoming[i] = j
 	return incoming
 
 
