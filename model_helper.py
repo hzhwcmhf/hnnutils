@@ -15,7 +15,8 @@ class BaseModel():
 	def __init__(self, param, net, optimizerList, checkpoint_manager, helperList=None):
 		self.param = param
 		self.args = args = param.args
-		self.param.other_weights = Storage()
+		if "other_weights" not in self.param:
+			self.param.other_weights = Storage()
 
 		self.net = net
 
@@ -53,7 +54,8 @@ class BaseModel():
 			self.now_batch = checkpoint['now_batch']
 			self.now_epoch = checkpoint['now_epoch']
 			self.net.load_state_dict(checkpoint['weights'], param.volatile.load_exclude_set)
-			self.param.other_weights = checkpoint['other_weights']
+			if "restore_other_weights" in self.param.args and self.param.args.restore_other_weights:
+				self.param.other_weights = checkpoint['other_weights']
 			for name, optimizer in self.optimizerList.items():
 				if checkpoint[name]['state'] and self.param.args.restore_optimizer:
 					optimizer.load_state_dict(checkpoint[name])

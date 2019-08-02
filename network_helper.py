@@ -25,7 +25,7 @@ class BaseNetwork(BaseModule):
 
 	def in_collection(self, name, _set):
 		for cn in _set:
-			if "_" + cn in name:
+			if "_" + cn in name and ("_exclude_" + cn) not in name:
 				return True
 		return False
 
