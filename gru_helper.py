@@ -297,23 +297,40 @@ class SingleGRU(DecoderRNN):
 	def getInitialParameter(self, batch_size):
 		return self.h_init.repeat(1, batch_size, 1)
 
-	def forward(self, incoming, length, h_init=None, need_h=False):
-		sen_sorted, length_sorted, memo = sortSequence(incoming, length)
-		left_batch_size = sen_sorted.shape[-2]
-		sen_packed = pack_padded_sequence(sen_sorted, length_sorted)
+	# def forward(self, incoming, length, h_init=None, need_h=False):
+	# 	sen_sorted, length_sorted, memo = sortSequence(incoming, length)
+	# 	left_batch_size = sen_sorted.shape[-2]
+	# 	sen_packed = pack_padded_sequence(sen_sorted, length_sorted)
+	# 	if h_init is None:
+	# 		h_init = self.getInitialParameter(left_batch_size)
+	# 	else:
+	# 		h_init = torch.unsqueeze(sortSequenceByMemo(h_init, memo), 0)
+	# 	h, h_n = self.GRU(sen_packed, h_init)
+	# 	h_n = h_n.transpose(0, 1).reshape(left_batch_size, -1)
+	# 	h_n = revertSequence(h_n, memo)
+	# 	if need_h:
+	# 		h = pad_packed_sequence(h)[0]
+	# 		h = revertSequence(h, memo, True)
+	# 		return h_n, h
+	# 	else:
+	# 		return h_n, None
+
+	def forward(self, incoming, length, h_init=None):
+		batch_size = incoming.shape[1]
+		seqlen = incoming.shape[0]
 		if h_init is None:
-			h_init = self.getInitialParameter(left_batch_size)
+			h_init = self.getInitialParameter(batch_size)
 		else:
-			h_init = torch.unsqueeze(sortSequenceByMemo(h_init, memo), 0)
-		h, h_n = self.GRU(sen_packed, h_init)
-		h_n = h_n.transpose(0, 1).reshape(left_batch_size, -1)
-		h_n = revertSequence(h_n, memo)
-		if need_h:
-			h = pad_packed_sequence(h)[0]
-			h = revertSequence(h, memo, True)
-			return h_n, h
-		else:
-			return h_n, None
+			h_init = torch.unsqueeze(h_init, 0)
+		h_now = h_init[0]
+		hs = []
+
+		for i in range(seqlen):
+			h_now = self.cell_forward(incoming[i], h_now) \
+				* Tensor((length > np.ones(batch_size) * i).astype(float)).unsqueeze(-1)
+			hs.append(h_now)
+
+		return h_now, hs
 
 	def init_forward(self, batch_size, h_init=None):
 		if h_init is None:
